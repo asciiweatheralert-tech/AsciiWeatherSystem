@@ -191,5 +191,36 @@ def trigger_alert():
 
     return jsonify({"status": "success", "message": "Alert broadcast started in background."})
 
+@app.route('/debug-email')
+def debug_email():
+    """
+    Force sends a test email and shows the EXACT error on screen.
+    """
+    recipient = "jrtomasva09@gmail.com" # Replace with your email to test
+    
+    # 1. Check if Password exists
+    if not SENDER_PASSWORD:
+        return "❌ ERROR: SENDER_PASSWORD is missing in Environment Variables."
+    
+    try:
+        # 2. Try to Connect
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        
+        # 3. Try to Send
+        msg = MIMEText("This is a DEBUG email from your live website.")
+        msg['Subject'] = "Debug Test"
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = recipient
+        
+        server.send_message(msg)
+        server.quit()
+        return f"✅ SUCCESS! Email sent to {recipient}. Your credentials work."
+        
+    except Exception as e:
+        return f"❌ FAILED. Error details: {str(e)}"
+
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
+
