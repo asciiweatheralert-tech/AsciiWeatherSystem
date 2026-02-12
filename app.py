@@ -1,6 +1,7 @@
 import sqlite3
 import smtplib
 import os
+import threading # <--- NEW: Needed for background tasks
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, request, jsonify, render_template
@@ -8,14 +9,13 @@ from flask import Flask, request, jsonify, render_template
 app = Flask(__name__, template_folder='.', static_folder='.', static_url_path='')
 
 # ==============================================================================
-# 1. CONFIGURATION (THE SENDER)
+# 1. CONFIGURATION
 # ==============================================================================
-# In production, it's safer to use Environment Variables, but for now we keep this.
 SENDER_EMAIL = "ascii.weather.alert@gmail.com"
 SENDER_PASSWORD = "rcxg jftr wzel nwel"
 
 # ==============================================================================
-# 2. EMERGENCY HOTLINE DATABASE
+# 2. EMERGENCY HOTLINES
 # ==============================================================================
 HOTLINES = {
     'Angeles City, Pampanga': "• Angeles CDRRMO: (045) 322-7796\n• Pampanga PDRRMO: (045) 961-0414\n• Police: 166",
@@ -37,7 +37,6 @@ def init_db():
     try:
         conn = sqlite3.connect('thunderguard.db')
         c = conn.cursor()
-        # Create table with EMAIL column
         c.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,20 +49,18 @@ def init_db():
         ''')
         conn.commit()
         conn.close()
-        print("✅ Database initialized successfully.")
     except Exception as e:
-        print(f"❌ Database initialization failed: {e}")
+        print(f"❌ Database error: {e}")
 
-# Initialize DB immediately on startup
 init_db()
 
 # ==============================================================================
-# 4. HELPER FUNCTIONS
+# 4. EMAIL HELPER FUNCTIONS (BACKGROUND THREADING)
 # ==============================================================================
-def send_real_email(recipient_email, subject, body):
+def send_email_task(recipient_email, subject, body):
     """
-    Sends an actual email to the 'recipient_email'.
-    This recipient changes dynamically based on who is registered.
+    The actual email sending logic. 
+    Running this in a thread prevents the server from freezing.
     """
     try:
         msg = MIMEMultipart()
@@ -72,8 +69,8 @@ def send_real_email(recipient_email, subject, body):
         msg['Subject'] = subject
         msg.attach(MIMEText(body, 'plain'))
 
-        # Connect to Gmail Server
-        server = smtplib.SMTP('smtp.gmail.com', 587)
+        # Set a timeout so it doesn't hang forever
+        server = smtplib.SMTP('smtp.gmail.com', 587, timeout=10) 
         server.starttls()
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
         server.send_message(msg)
@@ -82,134 +79,110 @@ def send_real_email(recipient_email, subject, body):
     except Exception as e:
         print(f"❌ EMAIL FAILED to {recipient_email}: {str(e)}")
 
+def send_async_email(recipient_email, subject, body):
+    """
+    Wrapper to run the email task in the background.
+    """
+    thread = threading.Thread(target=send_email_task, args=(recipient_email, subject, body))
+    thread.start()
+
 def send_simulated_sms(phone_number, message):
     print(f"\n[SMS GATEWAY] Sending to {phone_number}: {message}")
     print("---------------------------------------------------")
 
 # ==============================================================================
-# 5. WEB PAGE ROUTES
+# 5. ROUTES
 # ==============================================================================
 @app.route('/')
-def home():
-    return render_template('login.html')
+def home(): return render_template('login.html')
 
 @app.route('/dashboard')
-def dashboard():
-    return render_template('index.html')
+def dashboard(): return render_template('index.html')
 
 @app.route('/login')
-def login_page():
-    return render_template('login.html')
+def login_page(): return render_template('login.html')
 
-# ==============================================================================
-# 6. API: REGISTER USER
-# ==============================================================================
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.json
-    conn = sqlite3.connect('thunderguard.db')
-    c = conn.cursor()
     try:
-        # Save the user's specific email to the database
+        conn = sqlite3.connect('thunderguard.db')
+        c = conn.cursor()
         c.execute("INSERT INTO users (name, role, phone, email, password) VALUES (?, ?, ?, ?, ?)",
                   (data['name'], data['role'], data['phone'], data.get('email', ''), data['password']))
         conn.commit()
-        return jsonify({"status": "success", "message": "User registered successfully!"})
+        conn.close()
+        return jsonify({"status": "success", "message": "Registered!"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
-    finally:
-        conn.close()
 
-# ==============================================================================
-# 7. API: LOGIN USER
-# ==============================================================================
 @app.route('/api/login', methods=['POST'])
 def api_login():  
     data = request.json
-    user_input = data['phone']  # Can be Email OR Phone
+    user_input = data['phone']
     password = data['password']
-
     conn = sqlite3.connect('thunderguard.db')
     c = conn.cursor()
-    
-    # Check if input matches Phone OR Email
-    c.execute("""
-        SELECT * FROM users 
-        WHERE (phone=? OR email=?) AND password=?
-    """, (user_input, user_input, password))
-    
+    c.execute("SELECT * FROM users WHERE (phone=? OR email=?) AND password=?", (user_input, user_input, password))
     user = c.fetchone()
     conn.close()
-
     if user:
         return jsonify({"status": "success", "user": user[1], "role": user[2]})
     else:
         return jsonify({"status": "error", "message": "Invalid credentials"})
 
 # ==============================================================================
-# 8. API: TRIGGER ALERTS (UPDATED WITH LOCATION & HOTLINES)
+# 6. TRIGGER ALERTS (FIXED)
 # ==============================================================================
 @app.route('/api/trigger-alert', methods=['POST'])
 def trigger_alert():
     data = request.json
     level = data.get('level')
-    
-    # Get the location sent from the frontend (Default to Angeles if missing)
     location = data.get('location', 'Angeles City, Pampanga')
     
-    # 1. Fetch the correct hotlines for this location
     local_hotlines = HOTLINES.get(location, "National Emergency: 911")
 
-    # 2. Define Message Content based on Alert Level
+    # Message Content
     if level == 'yellow':
         subject = f"⚠️ ACSCI-gurado: YELLOW WARNING ({location})"
-        msg_body = (
-            f"WARNING: Heavy rain detected in {location}.\n"
-            "Flooding is possible in low-lying areas.\n\n"
-            "PRECAUTIONARY MEASURES:\n"
-            "- Monitor local news.\n"
-            "- Prepare emergency kit.\n\n"
-            f"EMERGENCY HOTLINES FOR {location.upper()}:\n"
-            f"{local_hotlines}"
-        )
+        msg_body = (f"WARNING: Heavy rain in {location}.\n\n"
+                    f"HOTLINES:\n{local_hotlines}")
     elif level == 'orange':
         subject = f"🚨 ACSCI-gurado: ORANGE WARNING ({location})"
-        msg_body = (
-            f"EMERGENCY: Severe thunderstorm imminent in {location}. Evacuate immediately.\n"
-            "Proceed to a nearby evacuation zone.\n\n"
-            f"For emergency contact these hotlines of {location.upper()}:\n"
-            f"{local_hotlines}"
-        )
+        msg_body = (f"EMERGENCY: Severe storm in {location}. Evacuate now.\n\n"
+                    f"HOTLINES:\n{local_hotlines}")
     else:
         return jsonify({"status": "ignored"})
 
-    # --- 3. GET ALL USERS FROM DATABASE ---
-    conn = sqlite3.connect('thunderguard.db')
-    c = conn.cursor()
-    users = c.execute("SELECT name, phone, email FROM users").fetchall()
-    conn.close()
+    # Get Users
+    try:
+        conn = sqlite3.connect('thunderguard.db')
+        c = conn.cursor()
+        users = c.execute("SELECT name, phone, email FROM users").fetchall()
+        conn.close()
+    except:
+        users = []
 
     print(f"\n--- TRIGGERING {level.upper()} ALERT FOR {location} ---")
 
-    # --- 4. LOOP AND SEND TO EACH REGISTERED EMAIL ---
+    # Send Alerts (Using Async Threading)
     for user in users:
         name = user[0]
         phone = user[1]
-        registered_email = user[2] 
+        email = user[2]
         
-        personal_msg = f"Hello {name},\n\n{msg_body}"
+        final_msg = f"Hello {name},\n\n{msg_body}"
         
-        # Send SMS (Simulated)
-        if phone:
-            send_simulated_sms(phone, personal_msg)
+        # SMS (Simulated - fast, so we keep it here)
+        if phone: send_simulated_sms(phone, final_msg)
             
-        # Send Email (Real)
-        if registered_email:
-            send_real_email(registered_email, subject, personal_msg)
+        # Email (Real - SLOW, so we use the Async Wrapper)
+        if email:
+            send_async_email(email, subject, final_msg)
 
+    # Return success immediately (Don't wait for emails!)
     return jsonify({"status": "success", "count": len(users)})
 
-# Only used for local testing. In production (Render), Gunicorn will run 'app' directly.
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
