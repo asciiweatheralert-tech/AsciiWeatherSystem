@@ -1,7 +1,7 @@
-import os 
+import os
 import sqlite3
 import smtplib
-import threading 
+import threading
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, request, jsonify, render_template
@@ -34,9 +34,10 @@ HOTLINES = {
 # 3. DATABASE SETUP
 # ==============================================================================
 def init_db():
+def init_db():
     conn = sqlite3.connect('thunderguard.db')
     c = conn.cursor()
-    # Create table with EMAIL column
+    # 1. Create table if not exists
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,23 +45,33 @@ def init_db():
             role TEXT NOT NULL,
             phone TEXT NOT NULL,
             email TEXT,
-            password TEXT NOT NULL
+            password TEXT NOT NULL,
+            is_online INTEGER DEFAULT 0 
         )
     ''')
+    
+    # 2. SELF-HEALING: Check if 'is_online' exists. If not, add it.
+    try:
+        c.execute("SELECT is_online FROM users LIMIT 1")
+    except sqlite3.OperationalError:
+        print("⚠️ Updating Database: Adding 'is_online' column...")
+        c.execute("ALTER TABLE users ADD COLUMN is_online INTEGER DEFAULT 0")
+    
+    # 3. Reset everyone to Offline when the server starts
+    c.execute("UPDATE users SET is_online = 0")
+    
     conn.commit()
     conn.close()
 
+# Run DB setup
 init_db()
 
 # ==============================================================================
 # 4. HELPER FUNCTIONS
 # ==============================================================================
+# --- BACKGROUND EMAIL TASK ---
 def send_email_task(recipient_email, subject, body):
-    """
-    Background task to send email. Catches errors so the server doesn't crash.
-    """
     if not SENDER_PASSWORD:
-        print(f"❌ EMAIL SKIPPED: Password not set.")
         return
 
     try:
@@ -70,29 +81,24 @@ def send_email_task(recipient_email, subject, body):
         msg['Subject'] = subject
         msg.attach(MIMEText(body, 'plain'))
 
-        # Add a timeout so it doesn't hang forever on Render
+        # Timeout set to 10s to prevent hanging
         server = smtplib.SMTP('smtp.gmail.com', 587, timeout=10)
         server.starttls()
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
         server.send_message(msg)
         server.quit()
         print(f"✅ EMAIL SENT to {recipient_email}")
-        
-    except OSError:
-        print(f"⚠️ CLOUD BLOCK: Render blocked email to {recipient_email}. (Normal on free tier).")
     except Exception as e:
         print(f"❌ EMAIL FAILED to {recipient_email}: {str(e)}")
 
+# --- WRAPPER FUNCTION ---
 def send_real_email(recipient_email, subject, body):
     """
-    Wrapper that starts the email task in a background thread.
-    This prevents the 'WORKER TIMEOUT' error on Render.
+    Starts the email in a background thread.
+    This fixes the 'Worker Timeout' error on Render.
     """
     thread = threading.Thread(target=send_email_task, args=(recipient_email, subject, body))
     thread.start()
-def send_simulated_sms(phone_number, message):
-    print(f"\n[SMS GATEWAY] Sending to {phone_number}: {message}")
-    print("---------------------------------------------------")
 
 # ==============================================================================
 # 5. WEB PAGE ROUTES
@@ -134,26 +140,27 @@ def register():
 @app.route('/api/login', methods=['POST'])
 def api_login():  
     data = request.json
-    user_input = data['phone']  # Can be Email OR Phone
+    user_input = data['phone']
     password = data['password']
 
     conn = sqlite3.connect('thunderguard.db')
     c = conn.cursor()
     
-    # Check if input matches Phone OR Email
-    c.execute("""
-        SELECT * FROM users 
-        WHERE (phone=? OR email=?) AND password=?
-    """, (user_input, user_input, password))
-    
+    # Check credentials
+    c.execute("SELECT * FROM users WHERE (phone=? OR email=?) AND password=?", (user_input, user_input, password))
     user = c.fetchone()
-    conn.close()
 
     if user:
+        # User found! Mark them as ONLINE (is_online = 1)
+        user_id = user[0]
+        c.execute("UPDATE users SET is_online = 1 WHERE id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+        
         return jsonify({"status": "success", "user": user[1], "role": user[2]})
     else:
+        conn.close()
         return jsonify({"status": "error", "message": "Invalid credentials"})
-
 # ==============================================================================
 # 8. API: TRIGGER ALERTS (UPDATED WITH LOCATION & HOTLINES)
 # ==============================================================================
@@ -161,45 +168,35 @@ def api_login():
 def trigger_alert():
     data = request.json
     level = data.get('level')
-    
-    # Get the location sent from the frontend (Default to Angeles if missing)
     location = data.get('location', 'Angeles City, Pampanga')
     
-    # 1. Fetch the correct hotlines for this location
     local_hotlines = HOTLINES.get(location, "National Emergency: 911")
 
-    # 2. Define Message Content based on Alert Level
+    # Message Content
     if level == 'yellow':
         subject = f"⚠️ ACSCI-gurado: YELLOW WARNING ({location})"
-        msg_body = (
-            f"WARNING: Heavy rain detected in {location}.\n"
-            "Flooding is possible in low-lying areas.\n\n"
-            "PRECAUTIONARY MEASURES:\n"
-            "- Monitor local news.\n"
-            "- Prepare emergency kit.\n\n"
-            f"EMERGENCY HOTLINES FOR {location.upper()}:\n"
-            f"{local_hotlines}"
-        )
+        msg_body = (f"WARNING: Heavy rain detected in {location}.\n\n"
+                    f"EMERGENCY HOTLINES:\n{local_hotlines}")
     elif level == 'orange':
         subject = f"🚨 ACSCI-gurado: ORANGE WARNING ({location})"
-        msg_body = (
-            f"EMERGENCY: Severe thunderstorm imminent in {location}. Evacuate immediately.\n"
-            "Proceed to a nearby evacuation zone.\n\n"
-            f"For emergency contact these hotlines of {location.upper()}:\n"
-            f"{local_hotlines}"
-        )
+        msg_body = (f"EMERGENCY: Severe storm in {location}. Evacuate immediately.\n\n"
+                    f"EMERGENCY HOTLINES:\n{local_hotlines}")
     else:
         return jsonify({"status": "ignored"})
 
-    # --- 3. GET ALL USERS FROM DATABASE ---
-    conn = sqlite3.connect('thunderguard.db')
-    c = conn.cursor()
-    users = c.execute("SELECT name, phone, email FROM users").fetchall()
-    conn.close()
+    # --- FETCH ONLY ONLINE USERS ---
+    try:
+        conn = sqlite3.connect('thunderguard.db')
+        c = conn.cursor()
+        # SELECT ONLY WHERE is_online = 1
+        users = c.execute("SELECT name, phone, email FROM users WHERE is_online = 1").fetchall()
+        conn.close()
+    except Exception as e:
+        print("DB Error:", e)
+        users = []
 
-    print(f"\n--- TRIGGERING {level.upper()} ALERT FOR {location} ---")
+    print(f"\n--- TRIGGERING {level.upper()} ALERT FOR {len(users)} ONLINE USERS ---")
 
-    # --- 4. LOOP AND SEND TO EACH REGISTERED EMAIL ---
     for user in users:
         name = user[0]
         phone = user[1]
@@ -211,7 +208,7 @@ def trigger_alert():
         if phone:
             send_simulated_sms(phone, personal_msg)
             
-        # Send Email (Real)
+        # Send Email (Real - Background Thread)
         if registered_email:
             send_real_email(registered_email, subject, personal_msg)
 
@@ -222,3 +219,4 @@ def trigger_alert():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=True)
+
