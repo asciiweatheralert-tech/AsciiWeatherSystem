@@ -1,6 +1,6 @@
-import os
 import sqlite3
 import smtplib
+import os
 import threading
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -9,7 +9,7 @@ from flask import Flask, request, jsonify, render_template
 app = Flask(__name__, template_folder='.', static_folder='.', static_url_path='')
 
 # ==============================================================================
-# 1. CONFIGURATION (THE SENDER)
+# 1. CONFIGURATION
 # ==============================================================================
 SENDER_EMAIL = "ascii.weather.alert@gmail.com"
 SENDER_PASSWORD = "rcxg jftr wzel nwel"
@@ -31,45 +31,48 @@ HOTLINES = {
 }
 
 # ==============================================================================
-# 3. DATABASE SETUP
+# 3. DATABASE SETUP (With Self-Healing)
 # ==============================================================================
 def init_db():
-def init_db():
-    conn = sqlite3.connect('thunderguard.db')
-    c = conn.cursor()
-    # 1. Create table if not exists
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            role TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            email TEXT,
-            password TEXT NOT NULL,
-            is_online INTEGER DEFAULT 0 
-        )
-    ''')
-    
-    # 2. SELF-HEALING: Check if 'is_online' exists. If not, add it.
     try:
-        c.execute("SELECT is_online FROM users LIMIT 1")
-    except sqlite3.OperationalError:
-        print("⚠️ Updating Database: Adding 'is_online' column...")
-        c.execute("ALTER TABLE users ADD COLUMN is_online INTEGER DEFAULT 0")
-    
-    # 3. Reset everyone to Offline when the server starts
-    c.execute("UPDATE users SET is_online = 0")
-    
-    conn.commit()
-    conn.close()
+        conn = sqlite3.connect('thunderguard.db')
+        c = conn.cursor()
+        
+        # 1. Create table if not exists
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                role TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                email TEXT,
+                password TEXT NOT NULL,
+                is_online INTEGER DEFAULT 0 
+            )
+        ''')
+        
+        # 2. SELF-HEALING: Check if 'is_online' exists. If not, add it.
+        try:
+            c.execute("SELECT is_online FROM users LIMIT 1")
+        except sqlite3.OperationalError:
+            print("⚠️ Updating Database: Adding 'is_online' column...")
+            c.execute("ALTER TABLE users ADD COLUMN is_online INTEGER DEFAULT 0")
+        
+        # 3. Reset everyone to Offline when server starts
+        c.execute("UPDATE users SET is_online = 0")
+        
+        conn.commit()
+        conn.close()
+        print("✅ Database initialized successfully.")
+    except Exception as e:
+        print(f"❌ Database Error: {e}")
 
-# Run DB setup
+# Run DB setup immediately
 init_db()
 
 # ==============================================================================
-# 4. HELPER FUNCTIONS
+# 4. EMAIL LOGIC (Threaded to prevent Render crashes)
 # ==============================================================================
-# --- BACKGROUND EMAIL TASK ---
 def send_email_task(recipient_email, subject, body):
     if not SENDER_PASSWORD:
         return
@@ -88,20 +91,25 @@ def send_email_task(recipient_email, subject, body):
         server.send_message(msg)
         server.quit()
         print(f"✅ EMAIL SENT to {recipient_email}")
+        
+    except OSError:
+        # Render free tier blocks these ports. We catch the error so app doesn't crash.
+        print(f"⚠️ CLOUD BLOCK: Render blocked email to {recipient_email}. (This is normal on free tier).")
     except Exception as e:
         print(f"❌ EMAIL FAILED to {recipient_email}: {str(e)}")
 
-# --- WRAPPER FUNCTION ---
 def send_real_email(recipient_email, subject, body):
     """
-    Starts the email in a background thread.
-    This fixes the 'Worker Timeout' error on Render.
+    Wrapper function that starts the email in a background thread.
     """
     thread = threading.Thread(target=send_email_task, args=(recipient_email, subject, body))
     thread.start()
 
+def send_simulated_sms(phone_number, message):
+    print(f"\n[SMS GATEWAY] Sending to {phone_number}: {message}")
+
 # ==============================================================================
-# 5. WEB PAGE ROUTES
+# 5. ROUTES
 # ==============================================================================
 @app.route('/')
 def home():
@@ -115,28 +123,21 @@ def dashboard():
 def login_page():
     return render_template('login.html')
 
-# ==============================================================================
-# 6. API: REGISTER USER
-# ==============================================================================
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.json
-    conn = sqlite3.connect('thunderguard.db')
-    c = conn.cursor()
     try:
-        # Save the user's specific email to the database
-        c.execute("INSERT INTO users (name, role, phone, email, password) VALUES (?, ?, ?, ?, ?)",
+        conn = sqlite3.connect('thunderguard.db')
+        c = conn.cursor()
+        # Register new user (Online status defaults to 0)
+        c.execute("INSERT INTO users (name, role, phone, email, password, is_online) VALUES (?, ?, ?, ?, ?, 0)",
                   (data['name'], data['role'], data['phone'], data.get('email', ''), data['password']))
         conn.commit()
-        return jsonify({"status": "success", "message": "User registered successfully!"})
+        conn.close()
+        return jsonify({"status": "success", "message": "Registered!"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
-    finally:
-        conn.close()
 
-# ==============================================================================
-# 7. API: LOGIN USER
-# ==============================================================================
 @app.route('/api/login', methods=['POST'])
 def api_login():  
     data = request.json
@@ -161,8 +162,9 @@ def api_login():
     else:
         conn.close()
         return jsonify({"status": "error", "message": "Invalid credentials"})
+
 # ==============================================================================
-# 8. API: TRIGGER ALERTS (UPDATED WITH LOCATION & HOTLINES)
+# 6. TRIGGER ALERTS (Sends ONLY to Online Users)
 # ==============================================================================
 @app.route('/api/trigger-alert', methods=['POST'])
 def trigger_alert():
@@ -214,9 +216,6 @@ def trigger_alert():
 
     return jsonify({"status": "success", "count": len(users)})
 
-# --- REPLACE THE BOTTOM OF YOUR FILE WITH THIS ---
-
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
-
+    app.run(host='0.0.0.0', port=port)
