@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import smtplib
-import threading  # <--- NEW: Allows background tasks
+import threading
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, request, jsonify, render_template
@@ -52,36 +52,33 @@ def init_db():
 init_db()
 
 # ==============================================================================
-# 4. BACKGROUND EMAIL WORKER (NEW & FASTER)
+# 4. BACKGROUND EMAIL WORKER (UPDATED TO PORT 465 SSL)
 # ==============================================================================
 def send_bulk_emails(users, subject, msg_body):
     """
-    Runs in the background. Connects ONCE, sends all emails, then closes.
-    This prevents the 'Worker Timeout' crash.
+    Runs in the background. Uses Port 465 (SSL) which is more reliable
+    for Cloud Hosting than Port 587.
     """
     if not SENDER_PASSWORD:
-        print("❌ SKIPPING EMAILS: Password not found.")
+        print("❌ SKIPPING EMAILS: Password not found in Environment Variables.")
         return
 
     print(f"🔄 BACKGROUND TASK: Sending emails to {len(users)} users...")
 
     try:
-        # 1. Connect to Gmail ONCE
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
+        # --- FIX: USE SMTP_SSL ON PORT 465 ---
+        # This is the "Secure" port that often fixes 'Network Unreachable' errors
+        server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
+        
+        # Login
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
 
-        # 2. Loop through users using the SAME connection
         count = 0
         for user in users:
             name = user[0]
             phone = user[1]
             user_email = user[2]
             
-            # Print for logs
-            if phone:
-                print(f"[SMS SIMULATION] Sending to {phone}")
-
             if user_email:
                 try:
                     personal_msg = f"Hello {name},\n\n{msg_body}"
@@ -97,7 +94,6 @@ def send_bulk_emails(users, subject, msg_body):
                 except Exception as e:
                     print(f"   -> Failed for {user_email}: {e}")
 
-        # 3. Quit connection
         server.quit()
         print(f"✅ FINISHED: Sent {count} emails successfully.")
 
@@ -152,7 +148,7 @@ def api_login():
         return jsonify({"status": "error", "message": "Invalid credentials"})
 
 # ==============================================================================
-# 6. TRIGGER ALERT (UPDATED WITH THREADING)
+# 6. TRIGGER ALERT
 # ==============================================================================
 @app.route('/api/trigger-alert', methods=['POST'])
 def trigger_alert():
@@ -178,49 +174,47 @@ def trigger_alert():
     else:
         return jsonify({"status": "ignored"})
 
-    # 1. Get users from DB
     conn = sqlite3.connect('thunderguard.db')
     c = conn.cursor()
     users = c.execute("SELECT name, phone, email FROM users").fetchall()
     conn.close()
 
-    # 2. Start Background Thread (This fixes the timeout!)
-    # The server will return "Success" immediately, and Python handles emails in the background.
+    # Start Background Thread
     email_thread = threading.Thread(target=send_bulk_emails, args=(users, subject, msg_body))
     email_thread.start()
 
     return jsonify({"status": "success", "message": "Alert broadcast started in background."})
 
+# ==============================================================================
+# 7. DEBUG ROUTE (TEST EMAIL MANUALLY)
+# ==============================================================================
 @app.route('/debug-email')
 def debug_email():
     """
-    Force sends a test email and shows the EXACT error on screen.
+    Use this route to test if emails work.
+    Go to: https://your-website.com/debug-email
     """
-    recipient = "jrtomasva09@gmail.com" # Replace with your email to test
+    recipient = "jrtomasva09@gmail.com" # Default test email
     
-    # 1. Check if Password exists
     if not SENDER_PASSWORD:
         return "❌ ERROR: SENDER_PASSWORD is missing in Environment Variables."
     
     try:
-        # 2. Try to Connect
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
+        # Using SMTP_SSL (Port 465) for Debug too
+        server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
         
-        # 3. Try to Send
         msg = MIMEText("This is a DEBUG email from your live website.")
-        msg['Subject'] = "Debug Test"
+        msg['Subject'] = "Debug Test (Port 465)"
         msg['From'] = SENDER_EMAIL
         msg['To'] = recipient
         
         server.send_message(msg)
         server.quit()
-        return f"✅ SUCCESS! Email sent to {recipient}. Your credentials work."
+        return f"✅ SUCCESS! Email sent to {recipient} using Port 465."
         
     except Exception as e:
-        return f"❌ FAILED. Error details: {str(e)}"
+        return f"❌ FAILED. Error: {str(e)}"
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
-
