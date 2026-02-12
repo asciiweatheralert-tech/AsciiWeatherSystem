@@ -31,14 +31,14 @@ HOTLINES = {
 }
 
 # ==============================================================================
-# 3. DATABASE SETUP (Updated for Online Status)
+# 3. DATABASE SETUP (AUTO-FIXING)
 # ==============================================================================
 def init_db():
     try:
         conn = sqlite3.connect('thunderguard.db')
         c = conn.cursor()
         
-        # Create users table with is_online column
+        # 1. Create table if it doesn't exist
         c.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,18 +51,28 @@ def init_db():
             )
         ''')
         
-        # Reset everyone to offline when server restarts (Clean slate)
+        # 2. SELF-HEALING: Check if 'is_online' column exists. If not, add it.
+        try:
+            # Try to select the column to see if it exists
+            c.execute("SELECT is_online FROM users LIMIT 1")
+        except sqlite3.OperationalError:
+            print("⚠️ Column 'is_online' missing. Adding it now...")
+            # If error, it means column is missing, so we add it
+            c.execute("ALTER TABLE users ADD COLUMN is_online INTEGER DEFAULT 0")
+            conn.commit()
+
+        # 3. Reset everyone to offline on startup
         c.execute("UPDATE users SET is_online = 0")
         conn.commit()
         conn.close()
-        print("✅ Database initialized. All users reset to offline.")
+        print("✅ Database initialized successfully.")
     except Exception as e:
         print(f"❌ Database error: {e}")
 
 init_db()
 
 # ==============================================================================
-# 4. EMAIL LOGIC (THREADED TO PREVENT CRASHES)
+# 4. EMAIL LOGIC (THREADED)
 # ==============================================================================
 def send_email_task(recipient_email, subject, body):
     try:
@@ -72,7 +82,7 @@ def send_email_task(recipient_email, subject, body):
         msg['Subject'] = subject
         msg.attach(MIMEText(body, 'plain'))
 
-        # 10-second timeout to stop it from hanging the server
+        # Timeout prevents server hanging
         server = smtplib.SMTP('smtp.gmail.com', 587, timeout=10)
         server.starttls()
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
@@ -81,7 +91,8 @@ def send_email_task(recipient_email, subject, body):
         print(f"✅ EMAIL SENT to {recipient_email}")
         
     except OSError:
-        print(f"⚠️ CLOUD BLOCK: Render blocked email to {recipient_email}. (Works on Localhost)")
+        # This catches the Render blocking error silently
+        print(f"⚠️ CLOUD BLOCK: Render blocked email to {recipient_email}. (This is normal on free tier).")
     except Exception as e:
         print(f"❌ EMAIL FAILED to {recipient_email}: {str(e)}")
 
@@ -110,7 +121,6 @@ def register():
     try:
         conn = sqlite3.connect('thunderguard.db')
         c = conn.cursor()
-        # Default is_online to 0
         c.execute("INSERT INTO users (name, role, phone, email, password, is_online) VALUES (?, ?, ?, ?, ?, 0)",
                   (data['name'], data['role'], data['phone'], data.get('email', ''), data['password']))
         conn.commit()
@@ -119,7 +129,6 @@ def register():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
 
-# --- LOGIN: MARKS USER AS ONLINE ---
 @app.route('/api/login', methods=['POST'])
 def api_login():  
     data = request.json
@@ -132,7 +141,7 @@ def api_login():
     user = c.fetchone()
     
     if user:
-        # Update status to ONLINE (1)
+        # Mark as ONLINE
         user_id = user[0]
         c.execute("UPDATE users SET is_online = 1 WHERE id = ?", (user_id,))
         conn.commit()
@@ -142,21 +151,8 @@ def api_login():
         conn.close()
         return jsonify({"status": "error", "message": "Invalid credentials"})
 
-# --- LOGOUT: MARKS USER AS OFFLINE (Add to your script.js if needed) ---
-@app.route('/api/logout', methods=['POST'])
-def api_logout():
-    data = request.json
-    phone = data.get('phone') # Identify user by phone or email
-    
-    conn = sqlite3.connect('thunderguard.db')
-    c = conn.cursor()
-    c.execute("UPDATE users SET is_online = 0 WHERE phone = ?", (phone,))
-    conn.commit()
-    conn.close()
-    return jsonify({"status": "success"})
-
 # ==============================================================================
-# 6. TRIGGER ALERTS (SENDS TO ONLINE USERS ONLY)
+# 6. TRIGGER ALERTS (ONLINE USERS ONLY)
 # ==============================================================================
 @app.route('/api/trigger-alert', methods=['POST'])
 def trigger_alert():
@@ -175,17 +171,16 @@ def trigger_alert():
     else:
         return jsonify({"status": "ignored"})
 
-    # --- FETCH ONLY ONLINE USERS ---
+    # Fetch ONLY ONLINE USERS
     try:
         conn = sqlite3.connect('thunderguard.db')
         c = conn.cursor()
-        # Filter by is_online = 1
         users = c.execute("SELECT name, phone, email FROM users WHERE is_online = 1").fetchall()
         conn.close()
     except:
         users = []
 
-    print(f"\n--- TRIGGERING {level.upper()} ALERT FOR {len(users)} ONLINE USERS IN {location} ---")
+    print(f"\n--- TRIGGERING {level.upper()} ALERT FOR {len(users)} ONLINE USERS ---")
 
     for user in users:
         name = user[0]
@@ -194,10 +189,10 @@ def trigger_alert():
         
         final_msg = f"Hello {name},\n\n{msg_body}"
         
-        # Always try SMS
+        # SMS (Simulated)
         if phone: send_simulated_sms(phone, final_msg)
             
-        # Try Email (Async)
+        # Email (Async)
         if email:
             send_async_email(email, subject, final_msg)
 
