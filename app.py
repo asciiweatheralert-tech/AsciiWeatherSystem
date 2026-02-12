@@ -1,7 +1,7 @@
 import sqlite3
 import smtplib
 import os
-import threading # <--- NEW: Needed for background tasks
+import threading # Required for background tasks
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, request, jsonify, render_template
@@ -15,7 +15,7 @@ SENDER_EMAIL = "ascii.weather.alert@gmail.com"
 SENDER_PASSWORD = "rcxg jftr wzel nwel"
 
 # ==============================================================================
-# 2. EMERGENCY HOTLINES
+# 2. EMERGENCY HOTLINE DATABASE
 # ==============================================================================
 HOTLINES = {
     'Angeles City, Pampanga': "• Angeles CDRRMO: (045) 322-7796\n• Pampanga PDRRMO: (045) 961-0414\n• Police: 166",
@@ -55,12 +55,12 @@ def init_db():
 init_db()
 
 # ==============================================================================
-# 4. EMAIL HELPER FUNCTIONS (BACKGROUND THREADING)
+# 4. EMAIL LOGIC (BACKGROUND THREADING)
 # ==============================================================================
 def send_email_task(recipient_email, subject, body):
     """
-    The actual email sending logic. 
-    Running this in a thread prevents the server from freezing.
+    Runs in the background. Attempts to send email but catches errors 
+    so the server doesn't crash if blocked by Render.
     """
     try:
         msg = MIMEMultipart()
@@ -69,26 +69,29 @@ def send_email_task(recipient_email, subject, body):
         msg['Subject'] = subject
         msg.attach(MIMEText(body, 'plain'))
 
-        # Set a timeout so it doesn't hang forever
-        server = smtplib.SMTP('smtp.gmail.com', 587, timeout=10) 
+        # Try connecting with a short timeout
+        server = smtplib.SMTP('smtp.gmail.com', 587, timeout=10)
         server.starttls()
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
         server.send_message(msg)
         server.quit()
         print(f"✅ EMAIL SENT to {recipient_email}")
+        
+    except OSError as e:
+        # This catches the "Network is unreachable" error on Render
+        print(f"⚠️ EMAIL SKIPPED: Cloud provider blocked the connection. (Localhost will work). Error: {e}")
     except Exception as e:
         print(f"❌ EMAIL FAILED to {recipient_email}: {str(e)}")
 
 def send_async_email(recipient_email, subject, body):
     """
-    Wrapper to run the email task in the background.
+    Starts the email task in a separate thread.
     """
     thread = threading.Thread(target=send_email_task, args=(recipient_email, subject, body))
     thread.start()
 
 def send_simulated_sms(phone_number, message):
     print(f"\n[SMS GATEWAY] Sending to {phone_number}: {message}")
-    print("---------------------------------------------------")
 
 # ==============================================================================
 # 5. ROUTES
@@ -132,7 +135,7 @@ def api_login():
         return jsonify({"status": "error", "message": "Invalid credentials"})
 
 # ==============================================================================
-# 6. TRIGGER ALERTS (FIXED)
+# 6. TRIGGER ALERTS (NON-BLOCKING)
 # ==============================================================================
 @app.route('/api/trigger-alert', methods=['POST'])
 def trigger_alert():
@@ -142,7 +145,6 @@ def trigger_alert():
     
     local_hotlines = HOTLINES.get(location, "National Emergency: 911")
 
-    # Message Content
     if level == 'yellow':
         subject = f"⚠️ ACSCI-gurado: YELLOW WARNING ({location})"
         msg_body = (f"WARNING: Heavy rain in {location}.\n\n"
@@ -154,7 +156,6 @@ def trigger_alert():
     else:
         return jsonify({"status": "ignored"})
 
-    # Get Users
     try:
         conn = sqlite3.connect('thunderguard.db')
         c = conn.cursor()
@@ -165,7 +166,6 @@ def trigger_alert():
 
     print(f"\n--- TRIGGERING {level.upper()} ALERT FOR {location} ---")
 
-    # Send Alerts (Using Async Threading)
     for user in users:
         name = user[0]
         phone = user[1]
@@ -173,14 +173,14 @@ def trigger_alert():
         
         final_msg = f"Hello {name},\n\n{msg_body}"
         
-        # SMS (Simulated - fast, so we keep it here)
+        # SMS (Fast, stays in main thread)
         if phone: send_simulated_sms(phone, final_msg)
             
-        # Email (Real - SLOW, so we use the Async Wrapper)
+        # Email (Slow/Blocked, goes to background thread)
         if email:
             send_async_email(email, subject, final_msg)
 
-    # Return success immediately (Don't wait for emails!)
+    # Respond immediately so the dashboard doesn't freeze
     return jsonify({"status": "success", "count": len(users)})
 
 if __name__ == '__main__':
